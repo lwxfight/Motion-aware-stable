@@ -10,33 +10,73 @@ from datasets.mixup import Mixup
 from timm.utils import accuracy, ModelEma
 import utils
 from scipy.special import softmax
+import torch.nn as nn
+from . import TripletLoss
+from torch.nn import functional as F
+from sklearn.metrics import recall_score, f1_score, roc_curve, auc
 
 
 def train_class_batch(model, samples, target, criterion):
     outputs = model(samples)
     loss = criterion(outputs, target)
-    return loss, outputs
+    z = nn.LogSoftmax(dim=1)(outputs)
+    return loss, outputs, z
 
 
 def get_loss_scale_for_deepspeed(model):
     optimizer = model.optimizer
     try:
-        return optimizer.loss_scale if hasattr(optimizer, "loss_scale") else optimizer.cur_scale
+        return (
+            optimizer.loss_scale
+            if hasattr(optimizer, "loss_scale")
+            else optimizer.cur_scale
+        )
     except Exception:
         return 0
 
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, amp_autocast, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None, log_writer=None,
-                    start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
-                    num_training_steps_per_epoch=None, update_freq=None, no_amp=False, bf16=False):
+def train_one_epoch(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    loss_scaler,
+    amp_autocast,
+    max_norm: float = 0,
+    model_ema: Optional[ModelEma] = None,
+    mixup_fn: Optional[Mixup] = None,
+    log_writer=None,
+    start_steps=None,
+    lr_schedule_values=None,
+    wd_schedule_values=None,
+    num_training_steps_per_epoch=None,
+    update_freq=None,
+    no_amp=False,
+    bf16=False,
+):
     model.train(True)
+
+    if dist.is_available() and dist.is_initialized():
+        pass
+    else:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12348"
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=0,
+            world_size=int(
+                os.environ["WORLD_SIZE"] if "WORLD_SIZE" in os.environ else 1
+            ),
+        )
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
+    metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    metric_logger.add_meter(
+        "min_lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}")
+    )
+    header = "Epoch: [{}]".format(epoch)
     print_freq = 1
 
     if loss_scaler is None:
@@ -45,40 +85,62 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     else:
         optimizer.zero_grad()
 
-    for data_iter_step, (samples, targets, _, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples1, samples2, samples3, targets, _, _) in enumerate(
+        metric_logger.log_every(data_loader, print_freq, header)
+    ):
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
         it = start_steps + step  # global training iteration
         # Update LR & WD for the first acc
-        if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0:
+        if (
+            lr_schedule_values is not None
+            or wd_schedule_values is not None
+            and data_iter_step % update_freq == 0
+        ):
             for i, param_group in enumerate(optimizer.param_groups):
                 if lr_schedule_values is not None:
                     if "lr_scale" in param_group:
-                        param_group["lr"] = lr_schedule_values[it] * param_group["lr_scale"]
+                        param_group["lr"] = (
+                            lr_schedule_values[it] * param_group["lr_scale"]
+                        )
                     else:
                         param_group["lr"] = lr_schedule_values[it]
                 if wd_schedule_values is not None and param_group["weight_decay"] > 0:
                     param_group["weight_decay"] = wd_schedule_values[it]
 
-        samples = samples.to(device, non_blocking=True)
+        samples1 = samples1.to(device, non_blocking=True)
+        samples2 = samples2.to(device, non_blocking=True)
+        samples3 = samples3.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         if mixup_fn is not None:
-            samples, targets = mixup_fn(samples, targets)
+            samples1, targets = mixup_fn(samples1, targets)
+            samples2, _ = mixup_fn(samples2, targets)
+            samples3, _ = mixup_fn(samples3, targets)
 
         if loss_scaler is None:
             if not no_amp:
-                samples = samples.bfloat16() if bf16 else samples.half()
-            loss, output = train_class_batch(
-                model, samples, targets, criterion)
+                samples1 = samples1.bfloat16() if bf16 else samples1.half()
+                samples2 = samples2.bfloat16() if bf16 else samples2.half()
+                samples3 = samples3.bfloat16() if bf16 else samples3.half()
+            loss1, output, z1 = train_class_batch(model, samples1, targets, criterion)
+            _, _, z2 = train_class_batch(model, samples2, targets, criterion)
+            _, _, z3 = train_class_batch(model, samples3, targets, criterion)
         else:
             with amp_autocast:
-                loss, output = train_class_batch(
-                    model, samples, targets, criterion)
+                loss1, output, z1 = train_class_batch(
+                    model, samples1, targets, criterion
+                )
+                _, _, z2 = train_class_batch(model, samples2, targets, criterion)
+                _, _, z3 = train_class_batch(model, samples3, targets, criterion)
+
+        tripletloss = TripletLoss.TripletLoss()
+        triplet_loss = tripletloss(z1, z2, z3)
+        KLloss = F.kl_div(z2.softmax(dim=-1).log(), z1.softmax(dim=-1), reduction="sum")
+        loss = loss1 + triplet_loss + 0.01 * KLloss
 
         loss_value = loss.item()
-
         loss_list = [torch.zeros_like(loss) for _ in range(dist.get_world_size())]
         dist.all_gather(loss_list, loss)
         loss_list = torch.tensor(loss_list)
@@ -86,7 +148,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         loss_list_isinf = torch.isinf(loss_list).any()
 
         if loss_list_isnan or loss_list_isinf:
-            print(" ========== loss_isnan = {},  loss_isinf = {} ========== ".format(loss_list_isnan, loss_list_isinf))
+            print(
+                " ========== loss_isnan = {},  loss_isinf = {} ========== ".format(
+                    loss_list_isnan, loss_list_isinf
+                )
+            )
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
@@ -103,13 +169,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             grad_norm = None
             loss_scale_value = get_loss_scale_for_deepspeed(model)
         else:
-            if loss_scaler != 'none':
+            if loss_scaler != "none":
                 # this attribute is added by timm on one optimizer (adahessian)
-                is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+                is_second_order = (
+                    hasattr(optimizer, "is_second_order") and optimizer.is_second_order
+                )
                 loss /= update_freq
-                grad_norm = loss_scaler(loss, optimizer, clip_grad=max_norm,
-                                        parameters=model.parameters(), create_graph=is_second_order,
-                                        update_grad=(data_iter_step + 1) % update_freq == 0)
+                grad_norm = loss_scaler(
+                    loss,
+                    optimizer,
+                    clip_grad=max_norm,
+                    parameters=model.parameters(),
+                    create_graph=is_second_order,
+                    update_grad=(data_iter_step + 1) % update_freq == 0,
+                )
                 if (data_iter_step + 1) % update_freq == 0:
                     optimizer.zero_grad()
                     if model_ema is not None:
@@ -136,8 +209,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(loss=loss_value)
         metric_logger.update(class_acc=class_acc)
         metric_logger.update(loss_scale=loss_scale_value)
-        min_lr = 10.
-        max_lr = 0.
+        min_lr = 10.0
+        max_lr = 0.0
         for group in optimizer.param_groups:
             min_lr = min(min_lr, group["lr"])
             max_lr = max(max_lr, group["lr"])
@@ -169,11 +242,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def validation_one_epoch(data_loader, model, device, amp_autocast, ds=True, no_amp=False, bf16=False, maxk=5):
+def validation_one_epoch(
+    data_loader, model, device, amp_autocast, ds=True, no_amp=False, bf16=False, maxk=5
+):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Val:'
+    header = "Val:"
 
     # switch to evaluation mode
     model.eval()
@@ -199,27 +274,40 @@ def validation_one_epoch(data_loader, model, device, amp_autocast, ds=True, no_a
 
         batch_size = videos.shape[0]
         metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
+        metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    print(
+        "* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}".format(
+            top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss
+        )
+    )
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 @torch.no_grad()
-def final_test(data_loader, model, device, file, amp_autocast, ds=True, no_amp=False, bf16=False, maxk=5):
+def final_test(
+    data_loader,
+    model,
+    device,
+    file,
+    amp_autocast,
+    ds=True,
+    no_amp=False,
+    bf16=False,
+    maxk=5,
+):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
+    header = "Test:"
 
     # switch to evaluation mode
     model.eval()
     final_result = []
-    
+
     for batch in metric_logger.log_every(data_loader, 10, header):
         videos = batch[0]
         target = batch[1]
@@ -241,30 +329,37 @@ def final_test(data_loader, model, device, file, amp_autocast, ds=True, no_amp=F
                 loss = criterion(output, target)
 
         for i in range(output.size(0)):
-            string = "{} {} {} {} {}\n".format(ids[i], \
-                                                str(output.data[i].float().cpu().numpy().tolist()), \
-                                                str(int(target[i].cpu().numpy())), \
-                                                str(int(chunk_nb[i].cpu().numpy())), \
-                                                str(int(split_nb[i].cpu().numpy())))
+            string = "{} {} {} {} {}\n".format(
+                ids[i],
+                str(output.data[i].float().cpu().numpy().tolist()),
+                str(int(target[i].cpu().numpy())),
+                str(int(chunk_nb[i].cpu().numpy())),
+                str(int(split_nb[i].cpu().numpy())),
+            )
             final_result.append(string)
 
         acc1, acc5 = accuracy(output, target, topk=(1, maxk))
 
+        # computeAccEachClass(output, target, 13)
         batch_size = videos.shape[0]
         metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
+        metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
 
     if not os.path.exists(file):
         os.mknod(file)
-    with open(file, 'w') as f:
+    with open(file, "w") as f:
         f.write("{}, {}\n".format(acc1, acc5))
         for line in final_result:
             f.write(line)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    print(
+        "* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}".format(
+            top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss
+        )
+    )
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -274,17 +369,20 @@ def merge(eval_path, num_tasks):
     dict_label = {}
     dict_pos = {}
     print("Reading individual output files")
-
     for x in range(num_tasks):
-        file = os.path.join(eval_path, str(x) + '.txt')
-        lines = open(file, 'r').readlines()[1:]
+        file = os.path.join(eval_path, str(x) + ".txt")
+        # print('file', file)
+        lines = open(file, "r").readlines()[1:]
+        print("len(lines): ", len(lines))
         for line in lines:
             line = line.strip()
-            name = line.split('[')[0]
-            label = line.split(']')[1].split(' ')[1]
-            chunk_nb = line.split(']')[1].split(' ')[2]
-            split_nb = line.split(']')[1].split(' ')[3]
-            data = np.fromstring(line.split('[')[1].split(']')[0], dtype=np.float32, sep=',')
+            name = line.split("[")[0]
+            label = line.split("]")[1].split(" ")[1]
+            chunk_nb = line.split("]")[1].split(" ")[2]
+            split_nb = line.split("]")[1].split(" ")[3]
+            data = np.fromstring(
+                line.split("[")[1].split("]")[0], dtype=np.float32, sep=","
+            )
             data = softmax(data)
             if not name in dict_feats:
                 dict_feats[name] = []
@@ -298,23 +396,29 @@ def merge(eval_path, num_tasks):
     print("Computing final results")
 
     input_lst = []
-    print(len(dict_feats))
     for i, item in enumerate(dict_feats):
         input_lst.append([i, item, dict_feats[item], dict_label[item]])
+    print("len(input_lst): ", len(input_lst))
     from multiprocessing import Pool
-    p = Pool(64)
+
+    p = Pool(1)
     ans = p.map(compute_video, input_lst)
     top1 = [x[1] for x in ans]
     top5 = [x[2] for x in ans]
     pred = [x[0] for x in ans]
     label = [x[3] for x in ans]
-    final_top1 ,final_top5 = np.mean(top1), np.mean(top5)
-    return final_top1*100 ,final_top5*100
+    final_top1, final_top5 = np.mean(top1), np.mean(top5)
+
+    return final_top1 * 100, final_top5 * 100
+
 
 def compute_video(lst):
     i, video_id, data, label = lst
+    print("len(data): ", len(data))
     feat = [x for x in data]
+    print("len(feat): ", len(feat))
     feat = np.mean(feat, axis=0)
+    print("len(mean feat)", len(feat))
     pred = np.argmax(feat)
     top1 = (int(pred) == int(label)) * 1.0
     top5 = (int(label) in np.argsort(-feat)[:5]) * 1.0

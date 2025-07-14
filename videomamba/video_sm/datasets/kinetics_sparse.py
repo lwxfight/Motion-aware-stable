@@ -7,31 +7,57 @@ from numpy.lib.function_base import disp
 import torch
 from torchvision import transforms
 import warnings
+import traceback  
 from decord import VideoReader, cpu
+import cv2
 from torch.utils.data import Dataset
 from .random_erasing import RandomErasing
 from .video_transforms import (
-    Compose, Resize, CenterCrop, Normalize,
-    create_random_augment, random_short_side_scale_jitter, 
-    random_crop, random_resized_crop_with_shift, random_resized_crop,
-    horizontal_flip, random_short_side_scale_jitter, uniform_crop, 
+    Compose,
+    Resize,
+    CenterCrop,
+    Normalize,
+    create_random_augment,
+    random_short_side_scale_jitter,
+    random_crop,
+    random_resized_crop_with_shift,
+    random_resized_crop,
+    horizontal_flip,
+    random_short_side_scale_jitter,
+    uniform_crop,
 )
 from .volume_transforms import ClipToTensor
 
 try:
     from petrel_client.client import Client
+
     has_client = True
 except ImportError:
     has_client = False
 
+
 class VideoClsDataset_sparse(Dataset):
     """Load your own video classification dataset."""
 
-    def __init__(self, anno_path, prefix='', split=' ', mode='train', clip_len=8,
-                 frame_sample_rate=2, crop_size=224, short_side_size=256,
-                 new_height=256, new_width=340, keep_aspect_ratio=True,
-                 num_segment=1, num_crop=1, test_num_segment=10, test_num_crop=3,
-                 args=None):
+    def __init__(
+        self,
+        anno_path,
+        prefix="",
+        split=" ",
+        mode="train",
+        clip_len=8,
+        frame_sample_rate=2,
+        crop_size=224,
+        short_side_size=256,
+        new_height=256,
+        new_width=340,
+        keep_aspect_ratio=True,
+        num_segment=1,
+        num_crop=1,
+        test_num_segment=10,
+        test_num_crop=3,
+        args=None,
+    ):
         self.anno_path = anno_path
         self.prefix = prefix
         self.split = split
@@ -50,43 +76,53 @@ class VideoClsDataset_sparse(Dataset):
         self.args = args
         self.aug = False
         self.rand_erase = False
+        self.num_aug = 4    # new
+        self.alpha_sr = 0.1
+        self.alpha_ri = 0.1
+        self.alpha_rs = 0.1
+        self.num_retries = 1
         assert num_segment == 1
-        if self.mode in ['train']:
+        if self.mode in ["train"]:
             self.aug = True
             if self.args.reprob > 0:
                 self.rand_erase = True
         if VideoReader is None:
-            raise ImportError("Unable to import `decord` which is required to read videos.")
+            raise ImportError(
+                "Unable to import `decord` which is required to read videos."
+            )
 
         import pandas as pd
+
         cleaned = pd.read_csv(self.anno_path, header=None, delimiter=self.split)
         self.dataset_samples = list(cleaned.values[:, 0])
         self.label_array = list(cleaned.values[:, 1])
 
         self.client = None
         if has_client:
-            self.client = Client('~/petreloss.conf')
+            self.client = Client("~/petreloss.conf")
 
-        if (mode == 'train'):
+        if mode == "train":
             pass
 
-        elif (mode == 'validation'):
-            self.data_transform = Compose([
-                Resize(self.short_side_size, interpolation='bilinear'),
-                CenterCrop(size=(self.crop_size, self.crop_size)),
-                ClipToTensor(),
-                Normalize(mean=[0.485, 0.456, 0.406],
-                                           std=[0.229, 0.224, 0.225])
-            ])
-        elif mode == 'test':
-            self.data_resize = Compose([
-                Resize(size=(short_side_size), interpolation='bilinear')
-            ])
-            self.data_transform = Compose([
-                ClipToTensor(),
-                Normalize(mean=[0.485, 0.456, 0.406],
-                                           std=[0.229, 0.224, 0.225])
-            ])
+        elif mode == "validation":
+            self.data_transform = Compose(
+                [
+                    Resize(self.short_side_size, interpolation="bilinear"),
+                    CenterCrop(size=(self.crop_size, self.crop_size)),
+                    ClipToTensor(),
+                    Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ]
+            )
+        elif mode == "test":
+            self.data_resize = Compose(
+                [Resize(size=(short_side_size), interpolation="bilinear")]
+            )
+            self.data_transform = Compose(
+                [
+                    ClipToTensor(),
+                    Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ]
+            )
             self.test_seg = []
             self.test_dataset = []
             self.test_label_array = []
@@ -99,106 +135,178 @@ class VideoClsDataset_sparse(Dataset):
                         self.test_seg.append((ck, cp))
 
     def __getitem__(self, index):
-        if self.mode == 'train':
-            args = self.args 
+        # for _retry in range(self.num_retries):
+        try:
+            if self.mode == "train":
+                args = self.args
+                sample = self.dataset_samples[index]
+                buffer = self.loadvideo_decord(sample, chunk_nb=-1)  # T H W C `这里是uint8`
+                if len(buffer) == 0:
+                    while len(buffer) == 0:
+                        warnings.warn(
+                            "video {} not correctly loaded during training".format(sample)
+                        )
+                        index = np.random.randint(self.__len__())
+                        sample = self.dataset_samples[index]
+                        buffer = self.loadvideo_decord(sample, chunk_nb=-1)
 
-            sample = self.dataset_samples[index]
-            buffer = self.loadvideo_decord(sample, chunk_nb=-1) # T H W C
-            if len(buffer) == 0:
-                while len(buffer) == 0:
-                    warnings.warn("video {} not correctly loaded during training".format(sample))
-                    index = np.random.randint(self.__len__())
-                    sample = self.dataset_samples[index]
-                    buffer = self.loadvideo_decord(sample, chunk_nb=-1)
+                # if args.num_sample > 1:
+                #     frame_list = []
+                #     label_list = []
+                #     index_list = []
+                #     for _ in range(args.num_sample):
+                #         new_frames = self._aug_frame(buffer, args)
+                #         label = self.label_array[index]
+                #         frame_list.append(new_frames)
+                #         label_list.append(label)
+                #         index_list.append(index)
+                #     return frame_list, label_list, index_list, {}
+                # else:
+                #     buffer = self._aug_frame(buffer, args)
 
-            if args.num_sample > 1:
-                frame_list = []
-                label_list = []
-                index_list = []
-                for _ in range(args.num_sample):
-                    new_frames = self._aug_frame(buffer, args)
-                    label = self.label_array[index]
-                    frame_list.append(new_frames)
-                    label_list.append(label)
-                    index_list.append(index)
-                return frame_list, label_list, index_list, {}
-            else:
-                buffer = self._aug_frame(buffer, args)
-            
-            return buffer, self.label_array[index], index, {}
+                # return buffer, self.label_array[index], index, {}
 
-        elif self.mode == 'validation':
-            sample = self.dataset_samples[index]
-            buffer = self.loadvideo_decord(sample, chunk_nb=0)
-            if len(buffer) == 0:
-                while len(buffer) == 0:
-                    warnings.warn("video {} not correctly loaded during validation".format(sample))
-                    index = np.random.randint(self.__len__())
-                    sample = self.dataset_samples[index]
-                    buffer = self.loadvideo_decord(sample, chunk_nb=0)
-            buffer = self.data_transform(buffer)
-            return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0]
+                if args.num_sample > 1:
+                    frame1_list = []
+                    frame2_list = []
+                    frame3_list = []
+                    label_list = []
+                    index_list = []
+                    for _ in range(args.num_sample):
+                        # frames1 = self.buffer2tensor(buffer, args)
+                        frames1 = buffer
+                        frames2 = self.stable(buffer)
+                        frames3 = self.GenNegative(buffer)
 
-        elif self.mode == 'test':
-            sample = self.test_dataset[index]
-            chunk_nb, split_nb = self.test_seg[index]
-            buffer = self.loadvideo_decord(sample, chunk_nb=chunk_nb)
+                        # frames1 = self.aug_after_aug(frames1)
+                        # frames2 = self.aug_after_aug(frames2)
+                        # frames3 = self.aug_after_aug(frames3)
+                        frames1 = self._aug_frame(frames1, args)
+                        frames2 = self._aug_frame(frames2, args)
+                        frames3 = self._aug_frame(frames3, args)
 
-            while len(buffer) == 0:
-                warnings.warn("video {}, temporal {}, spatial {} not found during testing".format(\
-                    str(self.test_dataset[index]), chunk_nb, split_nb))
-                index = np.random.randint(self.__len__())
+                        label = self.label_array[index]
+                        frame1_list.append(frames1)
+                        frame2_list.append(frames2)
+                        frame3_list.append(frames3)
+                        label_list.append(label)
+                        index_list.append(index)
+                    # print('aug done')
+                    
+                    # print("{} {} {}".format(frames1.dtype, frames2.dtype, frames3.dtype))
+                    return frame1_list, frame2_list, frame3_list, label_list, index_list, {}
+                else:
+                    # frames1 = self.buffer2tensor(buffer, args)
+                    frames1 = buffer
+                    frames2 = self.stable(buffer)
+                    frames3 = self.GenNegative(buffer)
+
+                    # frames1 = self.aug_after_aug(frames1)
+                    # frames2 = self.aug_after_aug(frames2)
+                    # frames3 = self.aug_after_aug(frames3)
+                    frames1 = self._aug_frame(frames1, args)
+                    frames2 = self._aug_frame(frames2, args)
+                    frames3 = self._aug_frame(frames3, args)
+                    # print('aug done')
+                    # print("{} {} {}".format(type(frames1), type(frames2), type(frames3)))
+                    return frames1, frames2, frames3, self.label_array[index], index, {}
+
+            elif self.mode == "validation":
+                sample = self.dataset_samples[index]
+                buffer = self.loadvideo_decord(sample, chunk_nb=0)
+                if len(buffer) == 0:
+                    while len(buffer) == 0:
+                        warnings.warn(
+                            "video {} not correctly loaded during validation".format(sample)
+                        )
+                        index = np.random.randint(self.__len__())
+                        sample = self.dataset_samples[index]
+                        buffer = self.loadvideo_decord(sample, chunk_nb=0)
+                # buffer = self.stable(buffer)
+                buffer = self.data_transform(buffer)
+                return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0]
+
+            elif self.mode == "test":
                 sample = self.test_dataset[index]
                 chunk_nb, split_nb = self.test_seg[index]
                 buffer = self.loadvideo_decord(sample, chunk_nb=chunk_nb)
 
-            buffer = self.data_resize(buffer)
-            if isinstance(buffer, list):
-                buffer = np.stack(buffer, 0)
-            if self.test_num_crop == 1:
-                spatial_step = 1.0 * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size) / 2
-                spatial_start = int(spatial_step)
+                while len(buffer) == 0:
+                    warnings.warn(
+                        "video {}, temporal {}, spatial {} not found during testing".format(
+                            str(self.test_dataset[index]), chunk_nb, split_nb
+                        )
+                    )
+                    index = np.random.randint(self.__len__())
+                    sample = self.test_dataset[index]
+                    chunk_nb, split_nb = self.test_seg[index]
+                    buffer = self.loadvideo_decord(sample, chunk_nb=chunk_nb)
+
+                # buffer = self.stable(buffer)
+                buffer = self.data_resize(buffer)
+                if isinstance(buffer, list):
+                    buffer = np.stack(buffer, 0)
+                if self.test_num_crop == 1:
+                    spatial_step = (
+                        1.0
+                        * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size)
+                        / 2
+                    )
+                    spatial_start = int(spatial_step)
+                else:
+                    spatial_step = (
+                        1.0
+                        * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size)
+                        / (self.test_num_crop - 1)
+                    )
+                    spatial_start = int(split_nb * spatial_step)
+                if buffer.shape[1] >= buffer.shape[2]:
+                    buffer = buffer[
+                        :, spatial_start : spatial_start + self.short_side_size, :, :
+                    ]
+                else:
+                    buffer = buffer[
+                        :, :, spatial_start : spatial_start + self.short_side_size, :
+                    ]
+
+                buffer = self.data_transform(buffer)
+                return (
+                    buffer,
+                    self.test_label_array[index],
+                    sample.split("/")[-1].split(".")[0],
+                    chunk_nb,
+                    split_nb,
+                )
             else:
-                spatial_step = 1.0 * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size) \
-                                    / (self.test_num_crop - 1)
-                spatial_start = int(split_nb * spatial_step)
-            if buffer.shape[1] >= buffer.shape[2]:
-                buffer = buffer[:, spatial_start:spatial_start + self.short_side_size, :, :]
-            else:
-                buffer = buffer[:, :, spatial_start:spatial_start + self.short_side_size, :]
+                raise NameError("mode {} unkown".format(self.mode))
+        except Exception as e:
+            # print('retry{}, error type'.format(_retry), e)
+            print(e)
+            traceback.print_exc()
+            index = np.random.randint(self.__len__())
+            # continue
+        # else:
+        #     print('aug error')
+                
 
-            buffer = self.data_transform(buffer)
-            return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
-                   chunk_nb, split_nb
-        else:
-            raise NameError('mode {} unkown'.format(self.mode))
+    def buffer2tensor(self, buffer, args):
+        # aug_transform = create_random_augment(
+        #     input_size=(self.crop_size, self.crop_size),
+        #     auto_augment=args.aa,
+        #     interpolation=args.train_interpolation,
+        # )
+        buffer = [transforms.ToPILImage()(frame) for frame in buffer]
 
-    def _aug_frame(
-        self,
-        buffer,
-        args,
-    ):
-
-        aug_transform = create_random_augment(
-            input_size=(self.crop_size, self.crop_size),
-            auto_augment=args.aa,
-            interpolation=args.train_interpolation,
-        )
-
-        buffer = [
-            transforms.ToPILImage()(frame) for frame in buffer
-        ]
-
-        buffer = aug_transform(buffer)
+        # buffer = aug_transform(buffer)
 
         buffer = [transforms.ToTensor()(img) for img in buffer]
-        buffer = torch.stack(buffer) # T C H W
-        buffer = buffer.permute(0, 2, 3, 1) # T H W C 
-        
-        # T H W C 
-        buffer = tensor_normalize(
-            buffer, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-        )
+        buffer = torch.stack(buffer)  # T C H W
+        buffer = buffer.permute(0, 2, 3, 1)  # T H W C
+        return buffer
+
+    def aug_after_aug(self, buffer, args):
+        # T H W C
+        buffer = tensor_normalize(buffer, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         # T H W C -> C T H W.
         buffer = buffer.permute(3, 0, 1, 2)
         # Perform data augmentation.
@@ -213,11 +321,67 @@ class VideoClsDataset_sparse(Dataset):
             min_scale=256,
             max_scale=320,
             crop_size=self.crop_size,
-            random_horizontal_flip=False if args.data_set == 'SSV2' else True ,
+            random_horizontal_flip=False if args.data_set == "SSV2" else True,
             inverse_uniform_sampling=False,
             aspect_ratio=asp,
             scale=scl,
-            motion_shift=False
+            motion_shift=False,
+        )
+
+        if self.rand_erase:
+            erase_transform = RandomErasing(
+                args.reprob,
+                mode=args.remode,
+                max_count=args.recount,
+                num_splits=args.recount,
+                device="cpu",
+            )
+            buffer = buffer.permute(1, 0, 2, 3)
+            buffer = erase_transform(buffer)
+            buffer = buffer.permute(1, 0, 2, 3)
+
+        return buffer
+
+    def _aug_frame(
+        self,
+        buffer,
+        args,
+    ):
+        aug_transform = create_random_augment(
+            input_size=(self.crop_size, self.crop_size),
+            auto_augment=args.aa,
+            interpolation=args.train_interpolation,
+        )
+
+        buffer = [transforms.ToPILImage()(frame) for frame in buffer]
+
+        buffer = aug_transform(buffer)
+
+        buffer = [transforms.ToTensor()(img) for img in buffer]
+        buffer = torch.stack(buffer)  # T C H W
+        buffer = buffer.permute(0, 2, 3, 1)  # T H W C
+
+        # T H W C
+        buffer = tensor_normalize(buffer, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        # T H W C -> C T H W.
+        buffer = buffer.permute(3, 0, 1, 2)
+        # Perform data augmentation.
+        scl, asp = (
+            [0.08, 1.0],
+            [0.75, 1.3333],
+        )
+
+        buffer = spatial_sampling(
+            buffer,
+            spatial_idx=-1,
+            min_scale=256,
+            max_scale=320,
+            crop_size=self.crop_size,
+            random_horizontal_flip=False if args.data_set == "SSV2" else True,
+            inverse_uniform_sampling=False,
+            aspect_ratio=asp,
+            scale=scl,
+            motion_shift=False,
         )
 
         if self.rand_erase:
@@ -235,7 +399,7 @@ class VideoClsDataset_sparse(Dataset):
         return buffer
 
     def _get_seq_frames(self, video_size, num_frames, clip_idx=-1):
-        seg_size = max(0., float(video_size - 1) / num_frames)
+        seg_size = max(0.0, float(video_size - 1) / num_frames)
         max_frame = int(video_size) - 1
         seq = []
         # index from 1, must add 1
@@ -247,7 +411,7 @@ class VideoClsDataset_sparse(Dataset):
                 seq.append(idx)
         else:
             num_segment = 1
-            if self.mode == 'test':
+            if self.mode == "test":
                 num_segment = self.test_num_segment
             duration = seg_size / (num_segment + 1)
             for i in range(num_frames):
@@ -260,42 +424,326 @@ class VideoClsDataset_sparse(Dataset):
     def loadvideo_decord(self, sample, chunk_nb=0):
         """Load video content using Decord"""
         fname = sample
-        fname = os.path.join(self.prefix, fname)
+        # fname = os.path.join(self.prefix, fname)
+        # print('fname ', "/".join(fname.split('/')[-3:]))
+        fname = self.prefix + "/" + "/".join(fname.split("/")[-3:])
+        # print(fname)
 
         try:
             if self.keep_aspect_ratio:
                 if "s3://" in fname:
                     video_bytes = self.client.get(fname)
-                    vr = VideoReader(io.BytesIO(video_bytes),
-                                     num_threads=1,
-                                     ctx=cpu(0))
+                    vr = VideoReader(io.BytesIO(video_bytes), num_threads=1, ctx=cpu(0))
                 else:
                     vr = VideoReader(fname, num_threads=1, ctx=cpu(0))
             else:
                 if "s3://" in fname:
                     video_bytes = self.client.get(fname)
-                    vr = VideoReader(io.BytesIO(video_bytes),
-                                     width=self.new_width,
-                                     height=self.new_height,
-                                     num_threads=1,
-                                     ctx=cpu(0))
+                    vr = VideoReader(
+                        io.BytesIO(video_bytes),
+                        width=self.new_width,
+                        height=self.new_height,
+                        num_threads=1,
+                        ctx=cpu(0),
+                    )
                 else:
-                    vr = VideoReader(fname, width=self.new_width, height=self.new_height,
-                                    num_threads=1, ctx=cpu(0))
+                    vr = VideoReader(
+                        fname,
+                        width=self.new_width,
+                        height=self.new_height,
+                        num_threads=1,
+                        ctx=cpu(0),
+                    )
 
             all_index = self._get_seq_frames(len(vr), self.clip_len, clip_idx=chunk_nb)
             vr.seek(0)
             buffer = vr.get_batch(all_index).asnumpy()
             return buffer
-        except:
-            print("video cannot be loaded by decord: ", fname)
+        except Exception as e:
+            print(
+                f"Error: Unable to load video using Decord: {fname}. Error details: {str(e)}"
+            )
             return []
 
     def __len__(self):
-        if self.mode != 'test':
+        if self.mode != "test":
             return len(self.dataset_samples)
         else:
             return len(self.test_dataset)
+
+    def movingAverage(self, curve, radius):
+        window_size = 2 * radius + 1
+        # Define the filter
+        f = np.ones(window_size) / window_size
+        # Add padding to the boundaries
+        curve_pad = np.lib.pad(curve, (radius, radius), "edge")
+        # Apply convolution
+        curve_smoothed = np.convolve(curve_pad, f, mode="same")
+        # Remove padding
+        curve_smoothed = curve_smoothed[radius:-radius]
+        # return smoothed curve
+        return curve_smoothed
+
+    def smooth(self, trajectory):
+
+        smoothed_trajectory = np.copy(trajectory)
+        # Filter the x, y and angle curves
+        for i in range(3):
+            smoothed_trajectory[:, i] = self.movingAverage(
+                trajectory[:, i], radius=self.SMOOTHING_RADIUS
+            )
+
+        return smoothed_trajectory
+
+    # Compute trajectory using cumulative sum of transformations
+
+    # Step 5.1 : Fix border artifacts
+    def fixBorder(self, frame):
+        s = frame.shape
+        # Scale the image 4% without moving the center
+        T = cv2.getRotationMatrix2D((s[1] / 2, s[0] / 2), 0, 1.04)
+        frame = cv2.warpAffine(frame, T, (s[1], s[0]))
+        return frame
+
+    def stable(self, frames):
+        # Step 1 : Set Input and Output Videos
+        # Read input video
+        # print("frames.shape", frames.shape) # (8,1080,1920,3)
+        # frames.shape torch.Size([8, 256, 454, 3])
+        # print(frames)
+        # frames = frames.cpu().detach().numpy().astype(np.uint8)
+        # print(frames)
+        # print('frames:', frames)
+        # Get frame count
+        n_frames = int(len(frames))
+        prev = frames[0]
+        # print("prev:", prev)
+        # Get width and height of video stream
+        w = len(frames[0][0])
+        h = len(frames[0])
+        # print("w,h", w, h)
+        # Define the codec for output video
+
+        self.SMOOTHING_RADIUS = 5
+
+        # Read the first frame and convert it to grayscale
+
+        # Step 2: Read the first frame and convert it to grayscale
+        # Read first frame
+
+        # Convert frame to grayscale
+        prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+
+        # Step 3: Find motion between frames
+
+        # Pre-define transformation-store array
+        transforms = np.zeros((n_frames, 3), np.float32)
+
+        for i in range(n_frames - 1):
+            # Detect feature points in previous frame
+            prev_pts = cv2.goodFeaturesToTrack(
+                prev_gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=30,
+                blockSize=3,
+            )
+            # Read next frame
+            if i < n_frames:
+                curr = frames[i + 1]
+            else:
+                curr = frames[i]
+            # Convert to grayscale
+            curr_gray = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
+
+            # Check the type and shape of the previous points matrix
+
+            # Check the type and shape of the current points matrix
+
+            # Calculate optical flow (i.e. track feature points)
+            curr_pts, status, err = cv2.calcOpticalFlowPyrLK(
+                prev_gray, curr_gray, prev_pts, None
+            )
+
+            # Sanity check
+            assert prev_pts.shape == curr_pts.shape
+
+            # Filter only valid points
+            idx = np.where(status == 1)[0]
+            prev_pts = prev_pts[idx]
+            curr_pts = curr_pts[idx]
+
+            # Find transformation matrix
+            # m = cv2.estimateRigidTransform(prev_pts, curr_pts, fullAffine=False)  # will only work with OpenCV-3 or less
+
+            # print(prev_pts.shape)
+            # print(curr_pts.shape)
+            assert prev_pts.shape == curr_pts.shape , "{}\n{}is not same".format(prev_pts.shape, curr_pts.shape)
+            assert len(prev_pts) > 0 and len(curr_pts) > 0, "{} and {} input point sets cannot be empty".format(prev_pts.shape, curr_pts.shape)
+            m, inlier = cv2.estimateAffinePartial2D(prev_pts, curr_pts)
+            # Extract traslation
+            dx = m[0, 2]
+            dy = m[1, 2]
+            # Extract rotation angle
+            da = np.arctan2(m[1, 0], m[0, 0])
+
+            # Store transformation
+            transforms[i] = [dx, dy, da]
+
+            # Move to next frame
+            prev_gray = curr_gray
+
+            # print("Frame: " + str(i) + "/" + str(n_frames) + " -  Tracked points : " + str(len(prev_pts)))
+
+        # Step 4: Calculate smooth motion between frames
+        # Compute trajectory using cumulative sum of transformations
+        trajectory = np.cumsum(transforms, axis=0)
+
+        # curve_smoothed = self.movingAverage()
+
+        smoothed_trajectory = self.smooth(trajectory)
+
+        trajectory = np.cumsum(transforms, axis=0)
+        # Step 4.3 : Calculate smooth transforms
+
+        # Calculate difference in smoothed_trajectory and trajectory
+        difference = smoothed_trajectory - trajectory
+
+        # Calculate newer transformation array
+        transforms_smooth = transforms + difference
+
+        # Step 5: Apply smoothed camera motion to frames
+        # Reset stream to first frame
+        # cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        new_frame = np.zeros((n_frames, h, w, 3), np.float32)
+        # Write n_frames-1 transformed frames
+        for i in range(n_frames):
+            # Read next frame
+            frame = frames[i]
+
+            # Extract transformations from the new transformation array
+            dx = transforms_smooth[i, 0]
+            dy = transforms_smooth[i, 1]
+            da = transforms_smooth[i, 2]
+
+            # Reconstruct transformation matrix accordingly to new values
+            m = np.zeros((2, 3), np.float32)
+            m[0, 0] = np.cos(da)
+            m[0, 1] = -np.sin(da)
+            m[1, 0] = np.sin(da)
+            m[1, 1] = np.cos(da)
+            m[0, 2] = dx
+            m[1, 2] = dy
+
+            # Apply affine wrapping to the given frame
+            frame_stabilized = cv2.warpAffine(frame, m, (w, h))
+
+            # Fix border artifacts
+            frame_stabilized = self.fixBorder(frame_stabilized)
+            # Write the frame to the file
+            new_frame[i] = frame_stabilized
+            # If the image is too big, resize it.
+            # if frame_out.shape[1] > 1920:
+            #     frame_out = cv2.resize(frame_out, (frame_out.shape[1] // 2, frame_out.shape[0] // 2))
+            #     print('frame_out', frame_out)
+            #     # cv2.imshow("Before and After", frame_out)
+            # cv2.waitKey(10)
+        # new_frame = torch.from_numpy(new_frame).cuda()
+        # new_frame = torch.tensor(new_frame, dtype=torch.uint8)
+        # print('new_frame.shape:', new_frame.shape)
+        # print('new_frame:', new_frame)
+        new_frame = new_frame.astype(np.uint8)
+        return new_frame
+
+    def GenNegative(self, inp):
+        inp = inp.copy()
+        # c, t, h, w = inp.size()
+        # c, t, h, w = inp.shape
+        t, h, w, c = inp.shape
+        augmented_sentences = []
+        num_new_per_technique = int(self.num_aug / 4) + 1
+        n_sr = max(1, int(self.alpha_sr * t))
+        n_ri = max(1, int(self.alpha_ri * t))
+        n_rs = max(1, int(self.alpha_rs * t))
+
+        # # sr synonym replacement
+        # for _ in range(num_new_per_technique):
+        #     inp = synonym_replacement(inp, n_sr)
+
+        # ri random insertion
+        for _ in range(num_new_per_technique):
+            inp = self.random_insertion(inp, n_ri)
+
+        # rs random swap
+        for _ in range(num_new_per_technique):
+            inp = self.random_swap(inp, n_rs)
+
+        # # rd random delte
+        # for _ in range(num_new_per_technique):
+        #     inp = random_deletion(inp, self.p_rd)
+
+        return inp
+
+    ########################################################################
+    # Random swap
+    # Randomly swap two words in the sentence n times
+    ########################################################################
+
+    def random_swap(self, videos, n):
+        videos = videos.copy()
+        new_videos = videos
+        for _ in range(n):
+            new_videos = self.swap_word(new_videos)
+        return new_videos
+
+    def swap_word(self, new_videos):
+        new_videos = new_videos.copy()
+        # c, t, h, w = new_videos.size()
+        # c, t, h, w = new_videos.shape
+        t, h, w, c = new_videos.shape
+        random_idx_1 = random.randint(0, t - 1)
+        random_idx_2 = random_idx_1
+        counter = 0
+        while random_idx_2 == random_idx_1:
+            random_idx_2 = random.randint(0, t - 1)
+            counter += 1
+            if counter > 3:
+                return new_videos
+        new_videos[random_idx_1, :, :, :], new_videos[random_idx_2, :, :, :] = (
+            new_videos[random_idx_2, :, :, :],
+            new_videos[random_idx_1, :, :, :],
+        )
+        return new_videos
+
+    ########################################################################
+    # Random insertion
+    # Randomly insert n words into the sentence
+    ########################################################################
+
+    def random_insertion(self, videos, n):
+        videos = videos.copy()
+        new_videos = videos
+        for _ in range(n):
+            new_videos = self.add_picture(new_videos)
+        return new_videos
+
+    def add_picture(self, videos):
+        # c, t, h, w = videos.size()
+        # c, t, h, w = videos.shape
+        t, h, w, c = videos.shape
+        videos = videos.copy()
+        new_videos = videos
+        random_idx = random.randint(0, t - 1)
+        random_idx2 = random.randint(0, t - 1)
+        # this is from the same sample, may be need modify
+        new_videos[random_idx + 1 :, :, :, :] = videos[random_idx : t - 1, :, :, :]
+        new_videos[random_idx, :, :, :] = videos[random_idx2, :, :, :]
+        return new_videos
+
+    ########################################################################
+    # main data augmentation function
+    ########################################################################
 
 
 def spatial_sampling(
@@ -348,9 +796,7 @@ def spatial_sampling(
             frames, _ = random_crop(frames, crop_size)
         else:
             transform_func = (
-                random_resized_crop_with_shift
-                if motion_shift
-                else random_resized_crop
+                random_resized_crop_with_shift if motion_shift else random_resized_crop
             )
             frames = transform_func(
                 images=frames,
@@ -365,9 +811,7 @@ def spatial_sampling(
         # The testing is deterministic and no jitter should be performed.
         # min_scale, max_scale, and crop_size are expect to be the same.
         assert len({min_scale, max_scale, crop_size}) == 1
-        frames, _ = random_short_side_scale_jitter(
-            frames, min_scale, max_scale
-        )
+        frames, _ = random_short_side_scale_jitter(frames, min_scale, max_scale)
         frames, _ = uniform_crop(frames, crop_size, spatial_idx)
     return frames
 
@@ -390,4 +834,3 @@ def tensor_normalize(tensor, mean, std):
     tensor = tensor - mean
     tensor = tensor / std
     return tensor
-

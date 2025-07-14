@@ -338,6 +338,7 @@ def main(args, ds_init):
             num_frames=args.num_frames,
         )
     elif 'videomamba' in args.model:
+        print('model: ', args.model)
         model = create_model(
             args.model,
             img_size=args.input_size,
@@ -368,7 +369,6 @@ def main(args, ds_init):
             use_mean_pooling=args.use_mean_pooling,
             init_scale=args.init_scale,
         )
-
     patch_size = model.patch_embed.patch_size
     print("Patch size = %s" % str(patch_size))
     args.window_size = (args.num_frames // args.tubelet_size, args.input_size // patch_size[0], args.input_size // patch_size[1])
@@ -599,12 +599,27 @@ def main(args, ds_init):
         optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
 
     if args.eval:
+        # print('num_tasks', num_tasks)
         preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
         test_stats = final_test(
             data_loader_test, model, device, preds_file, amp_autocast,
             ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
             maxk=5 if args.nb_classes >= 5 else 1
         )
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            pass
+        else:
+            os.environ['MASTER_ADDR'] = 'localhost'
+            os.environ['MASTER_PORT'] = '12348'
+            torch.distributed.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                rank=0,
+                world_size=int(
+                    os.environ["WORLD_SIZE"] if "WORLD_SIZE" in os.environ else 1
+                ),
+            )
         torch.distributed.barrier()
         if global_rank == 0:
             print("Start merging results...")
@@ -706,6 +721,8 @@ def main(args, ds_init):
 
 
 if __name__ == '__main__':
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     opts, ds_init = get_args()
     if opts.output_dir:
         Path(opts.output_dir).mkdir(parents=True, exist_ok=True)

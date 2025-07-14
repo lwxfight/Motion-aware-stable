@@ -244,6 +244,7 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
         dxz = torch.empty_like(xz)  # (batch, dim, seqlen)
         dx, dz = dxz.chunk(2, dim=1)
         # dout_y = rearrange(dout, "b l d -> b d l") # because no arrange at end of forward, so dout shape is b d l
+        delta = delta.to(torch.bfloat16)
         dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, dz, out_z = selective_scan_cuda.bwd(
             conv1d_out, delta, A, B, C, D, z, delta_bias, dout, scan_intermediates, out, dz,
             ctx.delta_softplus,

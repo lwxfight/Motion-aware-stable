@@ -4,8 +4,8 @@ export OMP_NUM_THREADS=1
 JOB_NAME='videomamba_middle_f8_res224'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
-PREFIX='your_k400_path'
-DATA_PATH='your_k400_metadata_path'
+PREFIX='../../../data/tiny-kinetics-400/data/tiny-Kinetics-400'
+DATA_PATH='../../../data/tiny-kinetics-400/annotations'
 
 PARTITION='video5'
 GPUS=16

@@ -4,32 +4,29 @@ export OMP_NUM_THREADS=1
 JOB_NAME='videomamba_middle_mask_ft_f8_res224'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
-PREFIX='your_k400_path'
-DATA_PATH='your_k400_metadata_path'
+# PREFIX='../../tiny-kinetics-400/data/tiny-Kinetics-400'
+# DATA_PATH='../../tiny-kinetics-400/annotations'
+# DATA_PATH='/data/datasets/Drone/list'
+DATA_PATH='../../list'
+PREFIX='/data/datasets'
 
-PARTITION='video5'
-GPUS=16
-GPUS_PER_NODE=8
-CPUS_PER_TASK=16
 
-srun -p $PARTITION \
-        --job-name=${JOB_NAME} \
-        --gres=gpu:${GPUS_PER_NODE} \
-        --ntasks=${GPUS} \
-        --ntasks-per-node=${GPUS_PER_NODE} \
-        --cpus-per-task=${CPUS_PER_TASK} \
-        --kill-on-bad-exit=1 \
-        python run_class_finetuning.py \
+NUM_GPUS=1
+# export CUDA_VISIBLE_DEVICES="0,1"
+
+# torchrun --nproc-per-node=$NUM_GPUS\
+
+python run_class_finetuning.py\
         --model videomamba_middle \
-        --finetune your_model_path/videomamba_m16_k400_mask_pt_f8_res224.pth \
+        --finetune ./pretrained_model/videomamba_m16_k400_mask_ft_f8_res224.pth \
         --data_path ${DATA_PATH} \
         --prefix ${PREFIX} \
         --data_set 'Kinetics_sparse' \
-        --split ',' \
-        --nb_classes 400 \
+        --split ' ' \
+        --nb_classes 13 \
         --log_dir ${OUTPUT_DIR} \
         --output_dir ${OUTPUT_DIR} \
-        --batch_size 32 \
+        --batch_size 1 \
         --num_sample 2 \
         --input_size 224 \
         --short_side_size 224 \
@@ -38,8 +35,8 @@ srun -p $PARTITION \
         --num_workers 12 \
         --warmup_epochs 5 \
         --tubelet_size 1 \
-        --epochs 45 \
-        --lr 1e-4 \
+        --epochs 91 \
+        --lr 1e-3 \
         --layer_decay 0.8 \
         --drop_path 0.4 \
         --opt adamw \
@@ -49,4 +46,5 @@ srun -p $PARTITION \
         --test_num_crop 3 \
         --dist_eval \
         --test_best \
-        --bf16
+        --bf16 \
+        --eval \

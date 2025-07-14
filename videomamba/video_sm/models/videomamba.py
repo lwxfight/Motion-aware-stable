@@ -26,11 +26,12 @@ except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 
-MODEL_PATH = 'your_model_path'
+MODEL_PATH = 'pretrained_model'
 _MODELS = {
     "videomamba_t16_in1k": os.path.join(MODEL_PATH, "videomamba_t16_in1k_res224.pth"),
     "videomamba_s16_in1k": os.path.join(MODEL_PATH, "videomamba_s16_in1k_res224.pth"),
     "videomamba_m16_in1k": os.path.join(MODEL_PATH, "videomamba_m16_in1k_res224.pth"),
+    "videomamba_m16_k400_mask_ft_f8_res224": os.path.join(MODEL_PATH, "videomamba_m16_k400_mask_ft_f8_res224.pth"),
 }
 
 
@@ -222,6 +223,8 @@ class VisionMamba(nn.Module):
             # checkpoint
             use_checkpoint=False,
             checkpoint_num=0,
+            pretrained_cfg=None,
+            pretrained_cfg_overlay=None
         ):
         factory_kwargs = {"device": device, "dtype": dtype} # follow MambaLMHeadModel
         super().__init__()
@@ -438,6 +441,9 @@ def videomamba_small(pretrained=False, **kwargs):
 
 @register_model
 def videomamba_middle(pretrained=False, **kwargs):
+    print('----------------')
+    for key, value in kwargs.items():
+            print(f"Key: {key}, Value: {value}")
     model = VisionMamba(
         patch_size=16, 
         embed_dim=576, 
@@ -450,7 +456,8 @@ def videomamba_middle(pretrained=False, **kwargs):
     model.default_cfg = _cfg()
     if pretrained:
         print('load pretrained weights')
-        state_dict = torch.load(_MODELS["videomamba_m16_in1k"], map_location='cpu')
+        # state_dict = torch.load(_MODELS["videomamba_m16_in1k"], map_location='cpu')
+        state_dict = torch.load(_MODELS["videomamba_m16_k400_mask_ft_f8_res224"], map_location='cpu')
         load_state_dict(model, state_dict, center=True)
     return model
 

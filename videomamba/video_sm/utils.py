@@ -640,20 +640,40 @@ def multiple_samples_collate(batch, fold=False):
     Returns:
         (tuple): collated data batch.
     """
-    inputs, labels, video_idx, extra_data = zip(*batch)
-    inputs = [item for sublist in inputs for item in sublist]
+    # inputs, labels, video_idx, extra_data = zip(*batch)
+    # inputs = [item for sublist in inputs for item in sublist]
+    # labels = [item for sublist in labels for item in sublist]
+    # video_idx = [item for sublist in video_idx for item in sublist]
+    # inputs, labels, video_idx, extra_data = (
+    #     default_collate(inputs),
+    #     default_collate(labels),
+    #     default_collate(video_idx),
+    #     default_collate(extra_data),
+    # )
+    # if fold:
+    #     return [inputs], labels, video_idx, extra_data
+    # else:
+    #     return inputs, labels, video_idx, extra_data
+
+    inputs1, inputs2, inputs3, labels, video_idx, extra_data = zip(*batch)
+    inputs1 = [item for sublist in inputs1 for item in sublist]
+    inputs2 = [item for sublist in inputs2 for item in sublist]
+    inputs3 = [item for sublist in inputs3 for item in sublist]
+
     labels = [item for sublist in labels for item in sublist]
     video_idx = [item for sublist in video_idx for item in sublist]
-    inputs, labels, video_idx, extra_data = (
-        default_collate(inputs),
+    inputs1, inputs2, inputs3, labels, video_idx, extra_data = (
+        default_collate(inputs1),
+        default_collate(inputs2),
+        default_collate(inputs3),
         default_collate(labels),
         default_collate(video_idx),
         default_collate(extra_data),
     )
     if fold:
-        return [inputs], labels, video_idx, extra_data
+        return [inputs1], [inputs2], [inputs3], labels, video_idx, extra_data
     else:
-        return inputs, labels, video_idx, extra_data
+        return inputs1, inputs2, inputs3, labels, video_idx, extra_data
 
 
 def multiple_pretrain_samples_collate(batch, fold=False):
